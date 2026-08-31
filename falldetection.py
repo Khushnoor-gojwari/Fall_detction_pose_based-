@@ -94,7 +94,7 @@ for _d in (MODELS_DIR, DATA_DIR, OUTPUT_DIR):
 # Give either one -- the interactive menu offers both and uses these as the
 # default when you press Enter without typing a path.
 VIDEO_PATH = os.path.join(DATA_DIR, "fall.mp4")   # e.g. data/test_video.mp4
-IMAGE_PATH = os.path.join(DATA_DIR, "test_image.jpg")   # e.g. data/test_image.jpg
+IMAGE_PATH = os.path.join(DATA_DIR, "MaleRest.png")   # e.g. data/test_image.jpg
 
 # ----------------------------------------------------------------------------
 # CONFIG  (tune these thresholds for your camera angle / scene)
@@ -103,9 +103,11 @@ IMAGE_PATH = os.path.join(DATA_DIR, "test_image.jpg")   # e.g. data/test_image.j
 DEFAULT_MODEL_SIZE = "n"
 
 # Detection / key-point confidence.
-PERSON_CONF = 0.35          # min person detection confidence
+PERSON_CONF = 0.25          # min person detection confidence
 KPT_CONF = 0.30             # min confidence for a key-point to be trusted
-IMG_SIZE = 640              # inference resolution
+IMG_SIZE = 1280             # inference resolution (higher = catches small/distant
+                            # people in crowded scenes, but slower). Lower to 960
+                            # or 640 for speed if the scene has few, large people.
 
 # --- Fall geometry thresholds -----------------------------------------------
 # Torso (spine) angle from the vertical axis, in degrees.
@@ -124,9 +126,25 @@ FALL_SPREAD_RATIO = 1.10
 # typical of kneeling / prayer, NOT of a person lying stretched out.
 KNEE_BENT_DEG = 130.0
 
-# --- Temporal confirmation (video / webcam only) ----------------------------
-FALL_CONFIRM_FRAMES = 6     # consecutive "fall" frames before we raise the alarm
-HISTORY_LEN = 12            # per-person rolling window length
+# --- MOTION-BASED fall detection (video / webcam only) ----------------------
+# A FALL is the *event* of a person who was UPRIGHT rapidly ending up on the
+# GROUND. This is what separates a real fall from someone who is simply lying
+# down, sitting, or praying: those people are never seen making a fast
+# upright -> ground transition (they are already low, or they lower themselves
+# slowly). Everything below is expressed per tracked person.
+#
+# "Upright" and "grounded" are read from the bounding-box aspect ratio (w/h),
+# which is robust across camera angles: standing people are taller than wide,
+# people on the floor are wider than tall.
+UPRIGHT_AR = 0.75           # w/h <= this  => person is upright (taller than wide)
+GROUND_AR = 1.05            # w/h >= this  => person is on the ground (wider)
+FALL_SPAN_SEC = 0.9         # the upright->ground transition must complete within
+                            # this many seconds to count as a *fall* (fast).
+                            # A slow, deliberate lie-down takes longer and is
+                            # therefore treated as normal.
+GROUND_CONFIRM = 3          # grounded for at least this many frames before alarm
+FALL_HOLD_SEC = 3.0         # keep the FALL label this long after the event
+                            # (cleared early if the person stands back up)
 
 # COCO skeleton links for drawing.
 SKELETON = [
@@ -349,9 +367,64 @@ def decide_display(info, confirmed_fall):
         return info["label"], COLOR_OK
 
     # Honest coarse mode.
-    if info["label"] == "FALL":
-        return "Falling?", COLOR_WATCH
     return "No Fall", COLOR_OK
+
+
+# ----------------------------------------------------------------------------
+# MOTION-BASED FALL MONITOR  (per tracked person, across frames)
+# ----------------------------------------------------------------------------
+class FallMonitor:
+    """Detects the *event* of falling: an UPRIGHT person who rapidly ends up on
+    the GROUND. People who are already lying, sitting, or praying, or who lower
+    themselves slowly, never trigger it.
+
+    For each tracked person we keep a short rolling history of the bounding-box
+    aspect ratio (w/h) with frame indices. A fall fires when the current state
+    is "grounded" and, within the last FALL_SPAN frames, the same person was
+    clearly "upright" (i.e. a fast upright -> ground transition).
+    """
+
+    def __init__(self, fps):
+        fps = fps if fps and fps > 0 else 30
+        self.span = max(4, int(FALL_SPAN_SEC * fps))     # transition window
+        self.hold = max(1, int(FALL_HOLD_SEC * fps))     # alarm hold time
+        self.hist = defaultdict(lambda: deque(maxlen=self.span + 2))
+        self.ground_streak = defaultdict(int)            # consecutive grounded frames
+        self.fall_until = {}                             # tid -> frame to hold FALL until
+
+    def update(self, tid, bbox, frame_idx):
+        """Feed one detection for a tracked person; return (is_fall, is_grounded)."""
+        if tid is None:
+            # Without a stable track id we cannot reason about motion safely.
+            return False, False
+
+        x1, y1, x2, y2 = bbox
+        w = max(1.0, x2 - x1)
+        h = max(1.0, y2 - y1)
+        ar = w / h
+        self.hist[tid].append((frame_idx, ar))
+
+        grounded = ar >= GROUND_AR
+        upright = ar <= UPRIGHT_AR
+
+        self.ground_streak[tid] = self.ground_streak[tid] + 1 if grounded else 0
+
+        # Standing back up clears any active fall.
+        if upright:
+            self.fall_until.pop(tid, None)
+
+        # Fall event: grounded now (confirmed for a few frames) AND was upright
+        # recently within the transition window -> a fast collapse.
+        if grounded and self.ground_streak[tid] >= GROUND_CONFIRM:
+            recent_upright = any(
+                a <= UPRIGHT_AR and (frame_idx - f) <= self.span
+                for (f, a) in self.hist[tid]
+            )
+            if recent_upright:
+                self.fall_until[tid] = frame_idx + self.hold
+
+        is_fall = self.fall_until.get(tid, -1) >= frame_idx
+        return is_fall, grounded
 
 
 # ----------------------------------------------------------------------------
@@ -422,10 +495,8 @@ def run_stream(model, source, show=True, out_name="fall_detection_output.mp4"):
     out_path = os.path.join(OUTPUT_DIR, out_name)
     writer = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
 
-    # Per-track rolling history of the raw single-frame fall flag.
-    history = defaultdict(lambda: deque(maxlen=HISTORY_LEN))
-    # Fallback counter when the tracker is unavailable (id is None).
-    anon_history = deque(maxlen=HISTORY_LEN)
+    # Motion-based fall detector (per tracked person, across frames).
+    monitor = FallMonitor(fps)
 
     print("Processing... press 'q' in the window to stop.")
     frame_idx = 0
@@ -435,7 +506,7 @@ def run_stream(model, source, show=True, out_name="fall_detection_output.mp4"):
             break
         frame_idx += 1
 
-        # Tracking gives stable IDs so temporal confirmation is per-person.
+        # Tracking gives stable IDs so motion can be reasoned per-person.
         results = model.track(
             frame, persist=True, conf=PERSON_CONF, imgsz=IMG_SIZE,
             verbose=False, classes=[0]
@@ -445,21 +516,13 @@ def run_stream(model, source, show=True, out_name="fall_detection_output.mp4"):
         any_fall = False
         for track_id, kpts, confs, bbox in extract_people(result):
             info = analyze_posture(kpts, confs, bbox)
-            raw_fall = info["is_fall"]
-
-            # Temporal confirmation.
-            if track_id is not None:
-                history[track_id].append(raw_fall)
-                recent = list(history[track_id])[-FALL_CONFIRM_FRAMES:]
-            else:
-                anon_history.append(raw_fall)
-                recent = list(anon_history)[-FALL_CONFIRM_FRAMES:]
-
-            confirmed_fall = (len(recent) >= FALL_CONFIRM_FRAMES and all(recent))
-            if confirmed_fall:
+            # FALL is decided by MOTION (upright -> ground fast), not by a static
+            # pose. This keeps lying / sitting / praying people as "No Fall".
+            is_fall, _grounded = monitor.update(track_id, bbox, frame_idx)
+            if is_fall:
                 any_fall = True
 
-            label, color = decide_display(info, confirmed_fall)
+            label, color = decide_display(info, is_fall)
             draw_person(frame, kpts, confs, bbox, label, color, track_id)
 
         if any_fall:
@@ -490,12 +553,12 @@ def run_image(model, img_path, show=True):
 
     result = model(frame, conf=PERSON_CONF, imgsz=IMG_SIZE, verbose=False, classes=[0])[0]
 
-    any_fall = False
+    # NOTE: a fall is a MOTION event (a person going down). It cannot be judged
+    # from a single still image, so here we only report posture and never raise a
+    # FALL. Use a video / webcam for actual fall detection.
     for _tid, kpts, confs, bbox in extract_people(result):
         info = analyze_posture(kpts, confs, bbox)
-        if info["is_fall"]:
-            any_fall = True
-        label, color = decide_display(info, info["is_fall"])
+        label, color = decide_display(info, False)
         m = info["metrics"]
         ta = f"{m['torso_angle']:.0f}" if m["torso_angle"] is not None else "-"
         # print keeps the detailed posture + metrics for tuning/debugging
@@ -503,9 +566,6 @@ def run_image(model, img_path, show=True):
               f"torso_angle={ta}  bbox_ratio={m['bbox_ratio']:.2f}  "
               f"spread={m['spread_ratio']:.2f}")
         draw_person(frame, kpts, confs, bbox, label, color)
-
-    if any_fall:
-        draw_alert_banner(frame, "FALL DETECTED")
 
     out_path = os.path.join(OUTPUT_DIR, "output_" + os.path.basename(img_path))
     cv2.imwrite(out_path, frame)

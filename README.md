@@ -12,9 +12,11 @@ fragile: a person kneeling, praying, crouching, or bending to pick something up
 often produces the same short, wide bounding box a fallen person does, so the
 detector fires constant false alarms.
 
-This project instead reasons about **body geometry** using pose estimation, so
-we can tell a real fall (body horizontal on the ground) apart from a controlled
-low posture (torso still upright, body still folded and vertically stacked).
+Just as important: a person who is **already lying down**, **sitting**, or
+**praying** is *not* falling. A fall is an **event** — someone who was upright
+suddenly ending up on the ground. So this project uses pose estimation for
+per-person tracking and decides a fall from **motion over time**, not from a
+single static pose.
 
 ## Why pose-based
 
@@ -31,30 +33,35 @@ cannot capture:
 | `knee_angle` | How bent the knees are (folded legs are typical of kneeling/prayer). |
 | vertical stacking | Whether the hips sit clearly above the ankles (feet tucked under the body). |
 
-## How a fall is decided
+## How a fall is decided (motion-based)
 
-A **FALL** is flagged only when the body is genuinely horizontal:
+Every person is tracked with a stable ID across frames. For each person we watch
+the bounding-box **aspect ratio** (`w/h`), which is robust across camera angles:
+
+- **Upright** (standing / walking): taller than wide (`w/h <= UPRIGHT_AR`).
+- **On the ground** (lying / collapsed): wider than tall (`w/h >= GROUND_AR`).
+
+A **FALL** fires only when a person makes a **fast upright -> ground transition**:
 
 ```
-torso is close to horizontal  AND  the body is wider than tall  AND  not vertically stacked
+the person was UPRIGHT, then within FALL_SPAN_SEC ended up on the GROUND
+(grounded for a few frames to confirm)
 ```
 
-**Praying and kneeling are rejected on purpose**, because in those postures:
+Why this rejects the normal cases you care about:
 
-- the torso stays upright (or the body stays folded), so it is not "horizontal", and
-- the hips remain clearly above the ankles (feet tucked under), so the body is
-  still *vertically stacked* and the box stays taller-than-wide.
+| Situation | What the tracker sees | Result |
+|---|---|---|
+| Already lying on a mattress | wide the whole time, never upright | **No Fall** |
+| Sitting down / kneeling | stays medium, never reaches full "ground" | **No Fall** |
+| Praying (ruku / sujood) | folded, lowers slowly, not a fast collapse | **No Fall** |
+| Standing then collapsing | upright -> ground within ~1 s | **FALL** |
 
-They therefore fail the fall test and are shown as `No Fall` (or, when detailed
-posture labels are enabled, as `Kneeling/Praying`). See "Camera placement
-matters" below for why only the coarse label is trustworthy on some cameras.
+The `FALL` label is held for `FALL_HOLD_SEC` after the event and cleared early if
+the person stands back up.
 
-### Temporal confirmation
-
-For video and webcam, each person is tracked with a stable ID and a fall is only
-declared after the condition holds for several consecutive frames
-(`FALL_CONFIRM_FRAMES`). This removes single-frame noise and ignores brief bends
-(tying a shoe, picking something up).
+> Because a fall is a motion event, it is only detected on **video / webcam**.
+> Running on a single image reports posture only and never raises a fall.
 
 ## Project structure
 
@@ -120,13 +127,30 @@ default in brackets, press Enter to use them or type another path to override.
 ## Tuning
 
 All thresholds live in the `CONFIG` block at the top of `falldetection.py`.
-Camera angle matters a lot, so adjust these for your scene:
 
-- `TORSO_HORIZONTAL_DEG` (default `55`): lower it if real falls are missed,
-  raise it if bending is misread as a fall.
-- `FALL_BBOX_RATIO` / `FALL_SPREAD_RATIO`: how "wide" the body must be.
-- `KNEE_BENT_DEG`: how bent the knees must be to count as kneeling/prayer.
-- `FALL_CONFIRM_FRAMES`: higher = fewer false alarms but slower to react.
+Motion / fall event (the important ones):
+
+- `UPRIGHT_AR` (default `0.75`): `w/h` at or below which a person counts as
+  upright. Raise it if standing people are missed from a steep camera angle.
+- `GROUND_AR` (default `1.05`): `w/h` at or above which a person counts as being
+  on the ground. Lower it if real falls are missed, raise it if deliberate
+  lie-downs get flagged.
+- `FALL_SPAN_SEC` (default `0.9`): the upright->ground transition must finish
+  within this time to count as a fall. Lower = stricter (only fast collapses).
+- `GROUND_CONFIRM` (default `3`): frames the person must stay grounded before the
+  alarm, to filter detection noise.
+- `FALL_HOLD_SEC` (default `3.0`): how long the `FALL` label stays up after the
+  event.
+
+Detection / crowd:
+
+- `IMG_SIZE` (default `1280`): higher catches small / distant / partly-occluded
+  people in crowded scenes but is slower; drop to `960` or `640` for speed.
+- `PERSON_CONF` (default `0.25`): lower to detect more (crowded) people.
+
+The static posture thresholds (`TORSO_HORIZONTAL_DEG`, `FALL_BBOX_RATIO`,
+`KNEE_BENT_DEG`, ...) now only feed the optional detailed posture *label* and no
+longer decide falls.
 
 ## Labels shown on screen
 
